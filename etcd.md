@@ -358,6 +358,8 @@ buddho/etcd-browser
 
 ## etcdkeeper
 
+
+
 ```
 docker run -it -d --name etcdkeeper \
 -p 8080:8080 \
@@ -368,6 +370,16 @@ deltaprojects/etcdkeeper
 ![img](https://img2018.cnblogs.com/blog/662544/201903/662544-20190310005821534-487981485.png)
 
 到这里，etcd的单机版搭建、集群版、客户端使用、rest api、web管理界面等功能都介绍了，你还在等什么，赶紧high起来
+
+## e3w
+
+https://github.com/xiaowei520/e3w
+
+## etcd-manager
+
+https://segmentfault.com/a/1190000016840950
+
+
 
 ## docker 安装错误处理
 
@@ -380,6 +392,17 @@ Error response from daemon: Get https://registry-1.docker.io/v2/deltaprojects/et
 通过该命令：dig @114.114.114.114 [registry-1.docker.io](http://registry-1.docker.io/) 可以获取到连接地址。
 
 # etcd 基本命令使用
+
+获取所有key
+
+ Curl http://127.0.0.1:22379/v2/keys\?recursive=true
+
+
+
+查看指定key-value
+  curl -s http://127.0.0.1:2479/v2/keys/services/default/tenantmanager
+
+
 
 ## 启动
 
