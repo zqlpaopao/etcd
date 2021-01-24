@@ -111,35 +111,109 @@ service KV {
 
 
 
+## C、串行读
+
+ <font color=green size=5x>**这种直接读取状态机的,无需通过Raft协议的与集群交互的方式,是串行读**</font>
+
+ <font color=red size=5x>**串行读具有低延时、高吞吐量的特点,适合对数据一致性不高的场景**</font>
 
 
-## C 、线性读流程-默认
+
+## D、线性读流程-默认
+
+<font color=red size=5x>**etcd默认是线性读**</font>
+
+
 
 ![image-20210123112955399](geektime-etcd.assets/image-20210123112955399.png)
+
+### 线性读ReadIndex
+
+读到距数据的原因是因为Follwer节点收到leader的同步写请求后,应用到自己的日志状态机是个异步过程
+
+1. <font color=red size=5x>**请求向C节点发送查询请求,会发起ReadIndex的请求,会像leader获取集群的==最新的已经提交的日志索引(committed index)**</font>
+2. <font color=r size=5x>**Leader收到ReadIndex请求后,==为防止脑裂,会像Follwer发送心跳确认,一半以上==节点确认Leader身份后才能将已提交的索引返回给C**</font>
+3. <font color=green size=5x>**C节点会等待,直到状态机已应用索引(applied index)大于等于Leader的已提交时候,==然后通知读请求,可以去读取数据了==**</font>
+4. <font color=red size=5x>**KVServer 模块收到线性读请求后，通过架构图中流程三向 Raft 模块发起 ReadIndex 请求，Raft 模块将 Leader 最新的已提交日志索引封装在流程四的 ReadState 结构体，通过 channel 层层返回给线性读模块，线性读模块等待本节点状态机追赶上 Leader 进度，追赶完成后，就通知 KVServer 模块，进行架构图中流程五，与状态机中的 MVCC 模块进行进行交互了。**</font>
+
+
+
+![image-20210124192054631](geektime-etcd.assets/image-20210124192054631.png)
+
+
+
+### MVCC
+
+1. <font color=red size=5x>**etcdV2是基于内存不支持事务控制**</font>
+2. <font color=rd size=5x>**V3的核心是==内存树形索引(treeindex)和嵌入式的KV持久化道boltdb组成**</font>
+3. <font color=blue size=5x>**每次修改操作，生成一个新的版本号 (revision)，以版本号为 key， value 为用户 key-value 等信息组成的结构体。**</font>
+4. <font color=red size=5x>**boltdb 的 key 是全局递增的版本号 (revision)，value 是用户 key、value 等字段组合成的结构体，然后通过 treeIndex 模块来保存用户 key 和版本号的映射关系。**</font>
+
+
+
+==treeIndex 与 boltdb 关系如下面的读事务流程图所示，从 treeIndex 中获取 key hello 的版本号，再以版本号作为 boltdb 的 key，从 boltdb 中获取其 value 信息。==
+
+![image-20210124193445224](geektime-etcd.assets/image-20210124193445224.png)
+
+
+
+### treeIndex
+
+<font color=red size=5x>B-tree 数据结构保存用户 key 与版本号之间的映射关系</font>
+
+<font color=red size=5x>==treeIndex 模块只会保存用户的 key 和相关版本号信息，用户 key 的 value 数据存储在 boltdb 里面，相比 ZooKeeper 和 etcd v2 全内存存储，etcd v3 对内存要求更低。==</font>
+
+
+
+从 treeIndex 模块中获取 hello 这个 key 对应的版本号信息。treeIndex 模块基于 B-tree 快速查找此 key，返回此 key 对应的索引项 keyIndex 即可。索引项中包含版本号等信息。
+
+
+
+### buffer
+
+在获取到版本号信息后，就可从 boltdb 模块中获取用户的 key-value 数据了。不过有一点你要注意，并不是所有请求都一定要从 boltdb 获取数据。etcd 出于数据一致性、性能等考虑，在访问 boltdb 前，首先会从一个内存读事务 buffer 中，==二分查找你要访问 key 是否在 buffer 里面==，若命中则直接返回。
+
+
+
+### boltdb
+
+<font color=re size=5x>**我们知道 MySQL 通过 table 实现不同数据逻辑隔离，那么在 boltdb 是如何隔离集群元数据与用户数据的呢？答案是 ==bucket。boltdb 里每个 bucket 类似对应 MySQL 一个表，`用户的 key 数据存放的 bucket 名字的是 key`，etcd MVCC 元数据存放的 bucket 是 meta。==**</font>
+
+
+
+<font color=red size=5x>**因 boltdb 使用 B+ tree 来组织用户的 key-value 数据，获取 bucket key 对象后，通过 boltdb 的游标 Cursor 可快速在 B+ tree 找到 key hello 对应的 value 数据，返回给 client。**</font>
+
+
+
+
+
+
+
+
+
+
 
 
 
 ### 数据不一致场景
 
-1、 <font color=red size=5x>**client 发起请求**</font>
+1、 <font color=red size=5x>**client 发起请求,读取状态机C,c盘出现网络波动,导致日志同步变慢**</font>
 
-2、<font color=red size=5x>**client 发起请求**</font>
+2、<font color=red size=5x>**因此读取到的数据可能是旧数据**</font>
 
-3、<font color=red size=5x>**client 发起请求**</font>
-
-4、<font color=red size=5x>**client 发起请求**</font>
-
-5、<font color=red size=5x>**client 发起请求**</font>
-
-6、<font color=red size=5x>**client 发起请求**</font>
+![image-20210124185543079](geektime-etcd.assets/image-20210124185543079.png)
 
 
 
 
 
+## 读取流程
+
+<font color=red size=5x>**一个读请求从 client 通过 Round-robin 负载均衡算法，选择一个 etcd server 节点，发出 gRPC 请求，经过 etcd server 的 KVServer 模块、线性读模块、MVCC 的 treeIndex 和 boltdb 模块紧密协作，完成了一个读请求。**</font>
 
 
 
+早期 etcd 线性读使用的 Raft log read，也就是说把读请求像写请求一样走一遍 Raft 的协议，基于 Raft 的日志的有序性，实现线性读。但此方案读涉及磁盘 IO 开销，性能较差，后来实现了 ReadIndex 读机制来提升读性能
 
 
 
