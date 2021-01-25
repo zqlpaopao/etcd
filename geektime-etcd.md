@@ -259,6 +259,521 @@ clientv3 库基于 gRPC client API 封装了操作 etcd KVServer、Cluster、Aut
 
 
 
+# 6、etcd写请求
+
+![image-20210125223314657](geektime-etcd.assets/image-20210125223314657.png)
+
+```go
+etcdctl put hello world --endpoints http://127.0.0.1:2379
+OK
+```
+
+1. <font color=red size=5x>client通过负载均衡选择一个etcd节点,发起gRPC调用</font>
+
+2. <font color=red size=5x>然后etcd节点收到请求后经过==gRPC拦截器、Qupta模块后,进入KVServer模块==</font>
+
+3. <font color=re size=5x>KVServer像Raft提交一个提案</font>
+
+4. <font color=red size=5x>随后提案经过RaftHTTP网络模块转发,经过集群多数节点持久化后,状态变为已提交模块</font>
+
+5. <font color=red size=5x>传递给apply模块,apply模块通过MVCC模块之执行天内容,更新状态机</font>
+
+   <font color=red size=5x>client通过负载均衡选择一个etcd节点,发起gRPC调用</font>
+
+
+
+## A、Quota db配额模块
+
+```go
+etcdserver: mvcc: database space exceeded
+```
+
+<font color=red size=5x>**db默认配额是2GB**</font>
+
+<font color=re size=5x>**每1小时进行一次压缩，并且保留8个小时的数据量，同时最大空间是默认的2GiB。**</font>
+
+<font color=red size=5x>**db默认配额是2GB**</font>
+
+<font color=red size=5x>**db默认配额是2GB**</font>
+
+
+
+<font color=red size=5x>**==工作原理==**</font>
+
+> 1. 当 etcd server 收到 put/txn 等写请求的时候，会首先检查下当前 etcd db 大小加上你请求的 key-value 大小之和是否超过了配额（quota-backend-bytes）。
+> 2. ==如果超过了配额，它会产生一个告警（Alarm）请求，告警类型是 NO SPACE，并通过 Raft 日志同步给其它节点，告知 db 无空间了，并将告警持久化存储到 db 中。==
+> 3. 最终，无论是 API 层 gRPC 模块还是负责将 Raft 侧已提交的日志条目应用到状态机的 Apply 模块，都拒绝写入，集群只读。
+
+
+
+## KVServer模块
+
+通过流程二的配额检查后，请求就从 API 层转发到了流程三的 KVServer 模块的 put 方法，我们知道 etcd 是基于 Raft 算法实现节点间数据复制的，==因此它需要将 put 写请求内容打包成一个提案消息，提交给 Raft 模块。==不过 KVServer 模块在提交提案前，还有如下的一系列检查和限速。
+
+
+
+<font color=red size=5x>==**Preflight Check**==</font>
+
+1. <font color=red size=5x>**其次它会检查你写入的包大小是否超过默认的 1.5MB， 如果超过了会返回"etcdserver: request is too large"错误给给 client。**</font>
+
+2. <font color=red size=5x>**<u>如果 Raft 模块已提交的日志索引（committed index）比已应用到状态机的日志索引（applied index）超过了 5000</u>**，那么它就返回一个"etcdserver: too many requests"错误给 client。</font>
+3. 
+
+为了保证集群稳定性，避免雪崩，任何提交到 Raft 模块的请求，都会做一些简单的限速判断。如下面的流程图所示，首先，**<u>如果 Raft 模块已提交的日志索引（committed index）比已应用到状态机的日志索引（applied index）超过了 5000</u>**，那么它就返回一个"etcdserver: too many requests"错误给 client。
+
+![image-20210125230542268](geektime-etcd.assets/image-20210125230542268.png)
+
+
+
+然后它会尝试去获取请求中的鉴权信息，若使用了密码鉴权、请求中携带了 token，如果 token 无效，则返回"auth: invalid auth token"错误给 client。
+
+其次它会检查你写入的包大小是否超过默认的 1.5MB， 如果超过了会返回"etcdserver: request is too large"错误给给 client。
+
+
+
+<font color=red size=5x>**Propose**</font>
+
+最后通过一系列检查之后，会生成一个唯一的 ID，将此请求关联到一个对应的消息通知 channel，然后向 Raft 模块发起（Propose）一个提案（Proposal），提案内容为“大家好，请使用 put 方法执行一个 key 为 hello，value 为 world 的命令”，也就是整体架构图里的流程四。
+
+向 Raft 模块发起提案后，KVServer 模块会等待此 put 请求，等待写入结果通过消息通知 channel 返回或者超时。==etcd 默认超时时间是 7 秒（5 秒磁盘 IO 延时 +2*1 秒竞选超时时间），如果一个请求超时未返回结果，则可能会出现你熟悉的 etcdserver: request timed out 错误。==
+
+
+
+## WAL模块
+
+1. <font color=red size=5x>**Raft 模块收到提案后，如果当前节点是 Follower，它会转发给 Leader，只有 Leader 才能处理写请求。**</font>
+2. <font color=green size=5x>**etcdserver 从 Raft 模块获取到以上消息和日志条目后，作为 Leader，它会将 put 提案消息广播给集群各个节点，``同时需要把集群 Leader 任期号、投票信息、已提交索引、提案内容持久化到一个 WAL（Write Ahead Log）日志文件中``，用于保证集群的一致性、可恢复性。**</font>
+3. <font color=re size=5x>**最后计算 WAL 记录的长度，顺序先写入 WAL 长度（Len Field），然后写入记录内容，调用 fsync 持久化到磁盘异步，完成将日志条目保存到持久化存储中。**</font>
+4. <font color=red size=5x>**当一半以上节点持久化此日志条目后， Raft 模块就会通过 channel 告知 etcdserver 模块，put 提案已经被集群多数节点确认，提案状态为已提交，你可以执行此提案内容了。**</font>
+5. <font color=red size=5x>**etcdserver 模块从 channel 取出提案内容，添加到先进先出（FIFO）调度队列，随后通过 Apply 模块按入队顺序，异步、依次执行提案内容。**</font>
+
+
+
+
+
+1. Leader 收到提案后，通过 Raft 模块输出待转发给 Follower 节点的消息和待持久化的日志条目，日志条目则封装了我们上面所说的 put hello 提案内容。
+
+![image-20210125231157837](geektime-etcd.assets/image-20210125231157837.png)
+
+
+
+## Apply模块
+
+![image-20210125231515715](geektime-etcd.assets/image-20210125231515715.png)
+
+
+
+<font color=red size=5x>**如何保证etcd crash后,找回异常提案**</font>
+
+> 核心就是我们上面介绍的 WAL 日志，因为提交给 Apply 模块执行的提案已获得多数节点确认、持久化，etcd 重启时，会从 WAL 中解析出 Raft 日志条目内容，追加到 Raft 日志的存储中，并重放已提交的日志提案给 Apply 模块执行。
+
+
+
+<font color=red size=5x>**如何保证幂等性**</font>
+
+==日志条目中的索引（index）字段和DB提交是原子性操作,保证幂等性==
+
+> 答案就是我们上面介绍 Raft ==日志条目中的索引（index）字段。==日志条目索引是全局单调递增的，每个日志条目索引对应一个提案， 如果一个命令执行后，我们在 db 里面也记录下当前已经执行过的日志条目索引，是不是就可以解决幂等性问题呢？
+>
+> 是的。但是这还不够安全，如果执行命令的请求更新成功了，更新 index 的请求却失败了，是不是一样会导致异常？
+>
+> ==因此我们在实现上，还需要将两个操作作为原子性事务提交，才能实现幂等。==
+
+
+
+> etcd 通过引入一个 consistent index 的字段，来存储系统当前已经执行过的日志条目索引，实现幂等性。
+>
+> Apply 模块在执行提案内容前，首先会判断当前提案是否已经执行过了，如果执行了则直接返回，若未执行同时无 db 配额满告警，则进入到 MVCC 模块，开始与持久化存储模块打交道。
+
+
+
+## MVCC
+
+Apply 模块判断此提案未执行后，就会调用 MVCC 模块来执行提案内容。MVCC 主要由两部分组成，一个是内存索引模块 treeIndex，保存 key 的历史版本号信息，另一个是 boltdb 模块，用来持久化存储 key-value 数据。那么 MVCC 模块执行 put hello 为 world 命令时，它是如何构建内存索引和保存哪些数据到 db 呢？
+
+<font color=red size=5x>**内存索引模块treeIndex**</font>
+
+<font color=red size=5x>**==treeIndex保存在内存中,重新会更新最大的版本号到内存==**</font>
+
+版本号（revision）在 etcd 里面发挥着重大作用，它是 etcd 的逻辑时钟。etcd 启动的时候默认版本号是 1，随着你对 key 的增、删、改操作而全局单调递增。
+
+
+
+> MVCC 写事务在执行 put hello 为 world 的请求时，会基于 currentRevision 自增生成新的 revision 如{2,0}，然后从 treeIndex 模块中查询 key 的创建版本号、修改次数信息。这些信息将填充到 boltdb 的 value 中，同时将用户的 hello key 和 revision 等信息存储到 B-tree
+
+![image-20210125232332741](geektime-etcd.assets/image-20210125232332741.png)
+
+
+
+## boltdb
+
+<font color=red size=5x>**B+tree实现**</font>
+
+MVCC 写事务自增全局版本号后生成的 revision{2,0}，它就是 boltdb 的 key，通过它就可以往 boltdb 写数据了，进入了整体架构图中的流程九。
+
+
+
+boltdb 上一篇我们提过它是一个基于 B+tree 实现的 key-value 嵌入式 db，它通过提供桶（bucket）机制实现类似 MySQL 表的逻辑隔离。
+
+
+
+在 etcd 里面你通过 put/txn 等 KV API 操作的数据，全部保存在一个名为 key 的桶里面，这个 key 桶在启动 etcd 的时候会自动创建。
+
+
+
+除了保存用户 KV 数据的 key 桶，etcd 本身及其它功能需要持久化存储的话，都会创建对应的桶。比如上面我们提到的 etcd 为了保证日志的幂等性，保存了一个名为 consistent index 的变量在 db 里面，它实际上就存储在元数据（meta）桶里面。
+
+
+
+## etcd 的解决方案是合并再合并。
+
+首先 boltdb key 是版本号，put/delete 操作时，都会基于当前版本号递增生成新的版本号，因此属于顺序写入，可以调整 boltdb 的 bucket.FillPercent 参数，使每个 page 填充更多数据，减少 page 的分裂次数并降低 db 空间。
+
+<font color=red size=5x>**其次 etcd 通过合并多个写事务请求，通常情况下，是异步机制定时（默认每隔 `100ms`）将批量事务一次性提交（pending 事务过多才会触发同步提交）， 从而大大提高吞吐量.**</font>
+
+
+
+
+
+## 因为事务未提交，读请求可能无法从 boltdb 获取到最新数据。
+
+为了解决这个问题，etcd 引入了一个 bucket buffer 来保存暂未提交的事务数据。在更新 boltdb 的时候，etcd 也会同步数据到 bucket buffer。因此 etcd 处理读请求的时候会优先从 bucket buffer 里面读取，其次再从 boltdb 读，通过 bucket buffer 实现读写性能提升，同时保证数据一致性。
+
+
+
+## 注意
+
+<font color=red size=5x>**为什么当你把配额（quota-backend-bytes）调大后，集群依然拒绝写入呢?**</font>
+
+原因就是我们前面提到的 NO SPACE 告警。Apply 模块在执行每个命令的时候，都会去检查当前是否存在 NO SPACE 告警，如果有则拒绝写入。所以还需要你额外发送一个取消告警（etcdctl alarm disarm）的命令，以消除所有告警。
+
+
+
+
+
+
+
+<u>如果你使用的是 etcd 3.2.10 之前的旧版本，请注意备份可能会触发 boltdb 的一个 Bug，它会导致 db 大小不断上涨，最终达到配额限制</u>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 常用命令
+
+## 查看etcd的配额使用量
+
+```
+[root@k8s001 ~]# export ETCDCTL_API=3
+[root@k8s001 ~]# etcdctl endpoint status --write-out table
++----------------+------------------+---------+---------+-----------+-----------+------------+
+|    ENDPOINT    |        ID        | VERSION | DB SIZE | IS LEADER | RAFT TERM | RAFT INDEX |
++----------------+------------------+---------+---------+-----------+-----------+------------+
+| 127.0.0.1:2379 | 8e9e05c52164694d |  3.3.10 |  7.8 MB |      true |         3 |    3085227 |
++----------------+------------------+---------+---------+-----------+-----------+------------+
+```
+
+
+
+## 开启磁盘碎片整理
+
+1. 获取历史版本号
+
+```
+[root@k8s001 ~]# export ETCDCTL_API=3
+[root@k8s001 ~]# etcdctl endpoint status --write-out="json" | egrep -o '"revision":[0-9]*' | egrep -o '[0-9].*'
+8991138
+```
+
+2. 压缩旧版本
+
+```
+[root@k8s001 ~]# etcdctl compact 8991138
+compacted revision 8991138
+```
+
+3. etcd进行碎片整理
+
+```
+[root@k8s001 ~]# etcdctl defrag  
+Finished defragmenting etcd member[127.0.0.1:2379]
+```
+
+4.查看etcd数据库大小
+
+```
+[root@k8s001 ~]# etcdctl endpoint status --write-out table
++----------------+------------------+---------+---------+-----------+-----------+------------+
+|    ENDPOINT    |        ID        | VERSION | DB SIZE | IS LEADER | RAFT TERM | RAFT INDEX |
++----------------+------------------+---------+---------+-----------+-----------+------------+
+| 127.0.0.1:2379 | 8e9e05c52164694d |  3.3.10 |  1.3 MB |      true |         3 |    3089646 |
++----------------+------------------+---------+---------+-----------+-----------+------------+
+```
+
+## 修改etcd空间配额大小
+
+1.修改systemd文件
+
+```
+[root@k8s001 ~]# cat /etc/systemd/system/etcd.service 
+......
+--quota-backend-bytes=10240000000 # 这里单位是字节
+......
+```
+
+2.重启etcd服务
+
+```
+[root@k8s001 ~]# systemctl daemon-reload
+[root@k8s001 ~]# systemctl restart etcd
+```
+
+
+
+## 清除NO SPACE警告
+
+```go
+$ etcdctl --endpoints=http://127.0.0.1:2379 alarm disarm
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
