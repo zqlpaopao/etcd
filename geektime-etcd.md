@@ -459,181 +459,7 @@ boltdb 上一篇我们提过它是一个基于 B+tree 实现的 key-value 嵌入
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# 常用命令
+# ==常用命令==
 
 ## 查看etcd的配额使用量
 
@@ -709,6 +535,294 @@ Finished defragmenting etcd member[127.0.0.1:2379]
 ```go
 $ etcdctl --endpoints=http://127.0.0.1:2379 alarm disarm
 ```
+
+
+
+
+
+
+
+
+
+# ==Raft协议==
+
+
+
+## 1、共识算法的三原则
+
+> 1. Leader 选举，Leader 故障后集群能快速选出新 Leader；
+> 2. 日志复制， ==集群只有 Leader 能写入日志==， Leader 负责复制日志到 Follower 节点，并强制 Follower 节点与自己保持相同；
+> 3. 安全性，==一个任期内集群只能产生一个 Leader==、已提交的日志条目在发生 Leader 选举时，**一定会存在`更高任期`的新 Leader 日志中**、各个节点的状态机应用的任意位置的日志条目内容应一样等。
+
+
+
+## 2、Leader选举
+
+## 写入流程
+
+1. <font color=red size=5x>**当etcd收到put hello的时候,KV模块会像Raft模块提交一个put提案**</font>
+
+2. <font color=re size=5x>**只有集群的leader才能处理提案**</font>
+
+3. <font color=red size=5x>**如果整个集群无leader,会请求超时**</font>
+
+
+
+## 三角色
+
+> 1. <font color=re size=5x>**Follower,跟随者,同步从leader收到的日志,etcd启动的时候默认为此状态**</font>
+> 2. <font color=red size=5x>**Candidate,竞选者,可以发起leader的选举**</font>
+> 3. <font color=re size=5x>**Leader,集群领导者,`唯一性`,拥有同步日志的特权,需要`定时广播心跳给Follwer节点,以维持领导者身份`**</font>
+
+
+
+![image-20210131200057963](geektime-etcd.assets/image-20210131200057963.png)
+
+
+
+## 3、选举过程
+
+![image-20210131200422082](geektime-etcd.assets/image-20210131200422082.png)
+
+
+
+> 1. <font color=red size=5x>**正常情况下,Leader节点会定时按照心跳间隔时间,定时的发送心跳小心(MsgHeartBeat消息)给Follwer节点,维持Leader身份,Follower收到后回定时回复(MsgHeartBeatResp消息)给Leader**</font>
+> 2. <font color=green size=5x>**tear任期号在etcd中是逻辑时钟**</font>
+
+
+
+<font color=re size=5x>**leader crash后的选举过程**</font>
+
+> 1. <font color=red size=5x>**当Leader异常之后,Follower节点回收到Leader的心跳超时,==当超时时间大于竞选时间后==,回进入Candidate状态**</font>
+> 2. <font color=red size=5x>**etcd默认的==心跳时间是(heartbeat-interval)`100ms`,默认精选超时时间是`1000ms`,==可根据实际情况进行设定**</font>
+> 3. <font color=re size=5x>**进入Candidate的节点回立即发起选举流程,==自增任期号,头片给自己==**并向其他节点发送精选Leader的消息(MsgVote)</font>
+> 4. <font color=red] size=5x>**第一种情况,B和C的数据一样,`B的任期大于C,并且C未投票给其他人`,就可以投票给B,这时候B获得多数节点的支持,称为Leader**</font>
+> 5. <font color=red size=5x>**第二种,恰巧C的超时时间也超过了精选的时间,发起精选,并投票给自己,那么将拒绝B的投票请求,这时候谁都获取不了多数的支持,等待超时,重新选举,为了解决这种情况,`Raft引入随机数让每个节点发起请求的时间点不一样,`优雅的解决竞争活锁的问题**</font>
+> 6. <font color=blue size=5x>**旧Leader发现新的Leader的任期号大于自己,回自动转变为Follower角色**</font>
+
+
+
+==A 节点 crash 后，再次启动成为 Follower，假设因为网络问题无法连通 B、C 节点，这时候根据状态图，我们知道它将不停自增任期号，发起选举。等 A 节点网络异常恢复后，那么现有 Leader 收到了新的任期号，就会触发新一轮 Leader 选举，影响服务的可用性。==
+
+###  **服务Leader重新加入新的集群怎么分辨真假Leader**
+
+> 1. <font color=red size=5x>**新加入的节点的数据会远落后于B、C节点,无法获取Leader地位**</font>
+
+
+
+###  如何避免无效选举
+
+> 1. <font color=red size=5x>**Follower在进入Candidate之前会进入PreVote参数(默认false)进入PreCandidate状态,==不自增任期号==发起预投票,获得多数节点认可,确定成为Leader才能进入Candidate状态,发起选举流程**</font>
+
+在 etcd 3.4 中，etcd 引入了一个 PreVote 参数（默认 false），可以用来启用 PreCandidate 状态解决此问题，如下图所示。Follower 在转换成 Candidate 状态前，先进入 PreCandidate 状态，不自增任期号， 发起预投票。若获得集群多数节点认可，确定有概率成为 Leader 才能进入 Candidate 状态，发起选举流程。
+
+![image-20210131202627403](geektime-etcd.assets/image-20210131202627403.png)
+
+
+
+
+
+## 4、日志复制
+
+![image-20210131203033437](geektime-etcd.assets/image-20210131203033437.png)
+
+
+
+> 1. 首先 Leader 收到 client 的请求后，etcdserver 的 KV 模块会向 Raft 模块提交一个 put hello 为 world 提案消息（流程图中的序号 2 流程）， 它的消息类型是 MsgProp。
+> 2. Leader 的 Raft 模块获取到 MsgProp 提案消息后，为此提案生成一个日志条目，追加到==未持久化、不稳定的 Raft 日志中==，随后会遍历集群 Follower 列表和进度信息，为每个 Follower 生成追加（MsgApp）类型的 RPC 消息，此消息中包含待复制给 Follower 的日志条目。
+
+
+
+### Leader从哪个索引位置发送日志
+
+> <font color=red size=5x>**Leader会维护Follower节点的进度信息,一个是NextIndex(表示发送给Folower的条目索引),一个是MatchIndex(表示Folower最大复制日志索引条目)**</font>
+
+
+
+![image-20210131203354658](geektime-etcd.assets/image-20210131203354658.png)
+
+
+
+### 日志什么时候才会追加到稳定的Raft日志中?Raft负责持久化吗?
+
+etcd Raft 模块设计实现上抽象了网络、存储、日志等模块，它本身并不会进行网络、存储相关的操作，上层应用需结合自己业务场景选择内置的模块或自定义实现网络、存储、日志等模块。
+
+> 1. <font color=red size=5x>**不会进行持久化操作,WAL进行持久化**</font>
+> 2.  <font color=red size=5x>**先进行WAL操作,然后同步==最后同步到持久化日志中==**</font>
+>
+> 3. <font color=re size=5x>**Leader 可通过在发送心跳消息（MsgHeartbeat）给 Follower 节点时，告知它已经提交的日志索引位置。**</font>
+> 4. <font color=red、 size=5x>**日志提交的前提是获取一半以上的节点的确认**</font>
+
+上层应用通过 Raft 模块的输出接口（如 Ready 结构），获取到待持久化的日志条目和待发送给 Peer 节点的消息后（如上面的 MsgApp 日志消息），需持久化日志条目到自定义的 WAL 模块，通过自定义的网络模块将消息发送给 Peer 节点。
+
+
+
+### 安全性
+
+>  如果在上面的日志图 2 中，Leader B 在应用日志指令 put hello 为 world 到状态机，并返回给 client 成功后，突然 crash 了，那么 Follower A 和 C 是否都有资格选举成为 Leader 呢？
+>
+> 从日志图 2 中我们可以看到，如果 A 成为了 Leader 那么就会导致数据丢失，因为它并未含有刚刚 client 已经写入成功的 put hello 为 world 指令。
+
+
+
+**Raft 算法如何确保面对这类问题时不丢数据和各节点数据一致性呢？**
+
+> 1. <font color=red、 size=5x>**前来要票的日志是否是最新的**</font>
+> 2. <font color=red size=5x>**任期号是否比自己大**</font>
+> 3. <font color=re size=5x>**一个任期内只有一个Leader**</font>
+> 4. <font color=red、 size=5x>**日志提交的前提是获取一半以上的节点的确认**</font>
+
+当节点收到选举投票的时候，需检查候选者的最后一条日志中的任期号，若小于自己则拒绝投票。如果任期号相同，日志却比自己短，也拒绝为其投票。
+
+比如在日志图 2 中，Folllower A 和 C 任期号相同，但是 Follower C 的数据比 Follower A 要长，那么在选举的时候，Follower C 将拒绝投票给 A， 因为它的数据不是最新的。
+
+同时，对于一个给定的任期号，最多只会有一个 leader 被选举出来，leader 的诞生需获得集群一半以上的节点支持。每个节点在同一个任期内只能为一个节点投票，节点需要将投票信息持久化，防止异常重启后再投票给其他节点。通过以上规则就可防止日志图 2 中的 Follower A 节点成为 Leader。
+
+### 日志复制规则
+
+> 1. 在日志图 2 中，Leader B 返回给 client 成功后若突然 crash 了，此时可能还并未将 6 号日志条目已提交的消息通知到 Follower A 和 C，那么如何确保 6 号日志条目不被新 Leader 删除呢？ 同时在 etcd 集群运行过程中，Leader 节点若频繁发生 crash 后，可能会导致 Follower 节点与 Leader 节点日志条目冲突，如何保证各个节点的同 Raft 日志位置含有同样的日志条目？
+> 2. 以上各类异常场景的安全性是通过 Raft 算法中的 Leader 完全特性和只附加原则、日志匹配等安全机制来保证的。
+> 3. Leader 完全特性是指如果某个日志条目在某个任期号中已经被提交，那么这个条目必然出现在更大任期号的所有 Leader 中。
+
+
+
+<font color=red size=6x>**`Leader 只能追加日志条目，不能删除已持久化的日志条目（只附加原则）`，因此 Follower C 成为新 Leader 后，会将前任的 6 号日志条目复制到 A 节点。**</font>
+
+
+
+> 为了保证各个节点日志一致性，Raft 算法在追加日志的时候，引入了一致性检查。Leader 在发送追加日志 RPC 消息时，会把新的日志条目紧接着之前的条目的索引位置和任期号包含在里面。==Follower 节点会检查相同索引位置的任期号是否与 Leader 一致，一致才能追加，这就是日志匹配特性。==它本质上是一种归纳法，一开始日志空满足匹配特性，随后每增加一个日志条目时，都要求上一个日志条目信息与 Leader 一致，那么最终整个日志集肯定是一致的。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
