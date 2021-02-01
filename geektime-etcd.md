@@ -536,6 +536,49 @@ Finished defragmenting etcd member[127.0.0.1:2379]
 $ etcdctl --endpoints=http://127.0.0.1:2379 alarm disarm
 ```
 
+## 开启鉴权
+
+鉴权用户
+
+```
+$ etcdctl user add root:root
+User root created
+$ etcdctl auth enable
+Authentication Enabled
+```
+
+## 增加账号
+
+下面我通过鉴权模块的 user 命令，给 etcd 增加一个 alice 账号。
+
+```
+$ etcdctl user add alice:alice --user root:root
+User alice created
+```
+
+## 授权
+
+```
+$ etcdctl put hello world --user alice:alice
+Error: etcdserver: permission denied
+```
+
+
+
+```go
+$ #创建一个admin role 
+etcdctl role add admin  --user root:root
+Role admin created
+# #分配一个可读写[hello，helly]范围数据的权限给admin role
+$ etcdctl role grant-permission admin readwrite hello helly --user root:root
+Role admin updated
+# 将用户alice和admin role关联起来，赋予admin权限给user
+$ etcdctl user grant-role alice admin --user root:root
+Role admin is granted to user alice
+```
+
+
+
 
 
 
@@ -691,6 +734,75 @@ etcd Raft 模块设计实现上抽象了网络、存储、日志等模块，它�
 
 
 > 为了保证各个节点日志一致性，Raft 算法在追加日志的时候，引入了一致性检查。Leader 在发送追加日志 RPC 消息时，会把新的日志条目紧接着之前的条目的索引位置和任期号包含在里面。==Follower 节点会检查相同索引位置的任期号是否与 Leader 一致，一致才能追加，这就是日志匹配特性。==它本质上是一种归纳法，一开始日志空满足匹配特性，随后每增加一个日志条目时，都要求上一个日志条目信息与 Leader 一致，那么最终整个日志集肯定是一致的。
+
+
+
+# 7、etcd的鉴权
+
+etcd 实现了 RBAC 机制，支持为每个用户分配一个角色，为每个角色授予最小化的权限。
+
+## 开启鉴权
+
+鉴权用户
+
+```
+$ etcdctl user add root:root
+User root created
+$ etcdctl auth enable
+Authentication Enabled
+```
+
+## 增加账号
+
+下面我通过鉴权模块的 user 命令，给 etcd 增加一个 alice 账号。
+
+```
+$ etcdctl user add alice:alice --user root:root
+User alice created
+```
+
+## 授权
+
+```
+$ etcdctl put hello world --user alice:alice
+Error: etcdserver: permission denied
+```
+
+
+
+```go
+$ #创建一个admin role 
+etcdctl role add admin  --user root:root
+Role admin created
+# #分配一个可读写[hello，helly]范围数据的权限给admin role
+$ etcdctl role grant-permission admin readwrite hello helly --user root:root
+Role admin updated
+# 将用户alice和admin role关联起来，赋予admin权限给user
+$ etcdctl user grant-role alice admin --user root:root
+Role admin is granted to user alice
+```
+
+
+
+
+
+## 密码认证
+
+### SimpleToken默认
+
+
+
+###  JWT
+
+## 证书认证
+
+在 etcd 中，如果你使用了 HTTPS 协议并启用了 client 证书认证 (--client-cert-auth)，它会取 CN 字段作为用户名，在我们的案例中，alice 就是 client 发送请求的用户名。
+
+## 查看client证书
+
+```
+openssl x509 -noout -text -in client.pem
+```
 
 
 
