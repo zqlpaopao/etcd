@@ -626,6 +626,30 @@ $ etcdctl get node -w=json | python -m json.tool
 
 
 
+## 获取历史版本
+
+```go
+# 指定查询版本号,获得了hello上一次修改的值
+$ etcdctl get hello --rev=2
+hello
+world1
+
+```
+
+
+
+## 删除历史版本或者key
+
+```go
+# 删除key hello
+$ etcdctl del  hello
+1
+# 删除后指定查询版本号3,获得了hello删除前的值
+$ etcdctl get hello --rev=3
+hello
+world2
+```
+
 
 
 
@@ -1076,6 +1100,160 @@ etcd Lessor 主循环<font color=red size=5x>**每隔 500ms 执行一次撤销 L
 
 
 
+# 9、Mvcc
+
+## 总结
+
+> treeIndex 模块基于 Google 开源的 btree 库实现，它的核心数据结构 keyIndex，保存了用户 key 与版本号关系。每次修改 key 都会生成新的版本号，生成新的 boltdb key-value。boltdb 的 key 为版本号，value 包含用户 key-value、各种版本号、lease 的 mvccpb.KeyValue 结构体。
+>
+> 
+>
+> 当你未带版本号查询 key 时，etcd 返回的是 key 最新版本数据。当你指定版本号读取数据时，etcd 实际上返回的是版本号生成那个时间点的快照数据。
+>
+> 
+>
+> 删除一个数据时，etcd 并未真正删除它，而是基于 lazy delete 实现的异步删除。删除原理本质上与更新操作类似，只不过 boltdb 的 key 会打上删除标记，keyIndex 索引中追加空的 generation。真正删除 key 是通过 etcd 的压缩组件去异步实现的，
+>
+> 
+>
+> etcd 实现了保存 key 历史版本的功能，是高可靠 Watch 机制的基础。基于 key-value 中的各种版本号信息，etcd 可提供各种级别的简易事务隔离能力。基于 Backend/boltdb 提供的 MVCC 机制，etcd 可实现读写不冲突。
+
+1. <font color=red size=5x>**MVCC 机制正是基于多版本技术实现的一种乐观锁机制**</font>
+
+​	它乐观地认为数据不会发生冲突，但是当事务提交时，具备检测数据是否冲突的能力。
+
+
+
+2. <font color=re size=5x>**当你指定版本号读取数据时，它实际上访问的是版本号生成那个时间点的快照数据。**</font>
+
+3. <font color=green size=5x>**当你删除数据的时候，它实际也是新增一条带删除标识的数据记录**</font>
+4. mod_revision，它表示 key 最后一次修改时的 etcd 版本号。
+
+
+
+## 1、获取历史版本
+
+```go
+
+# 更新key hello为world1
+$ etcdctl put hello world1
+OK
+# 通过指定输出模式为json,查看key hello更新后的详细信息
+$ etcdctl get hello -w=json
+{
+    "kvs":[
+        {
+            "key":"aGVsbG8=",
+            "create_revision":2,
+            "mod_revision":2,
+            "version":1,
+            "value":"d29ybGQx"
+        }
+    ],
+    "count":1
+}
+# 再次修改key hello为world2
+$ etcdctl put hello world2
+OK
+# 确认修改成功,最新值为wolrd2
+$ etcdctl get hello
+hello
+world2
+# 指定查询版本号,获得了hello上一次修改的值
+$ etcdctl get hello --rev=2
+hello
+world1
+# 删除key hello
+$ etcdctl del  hello
+1
+# 删除后指定查询版本号3,获得了hello删除前的值
+$ etcdctl get hello --rev=3
+hello
+world2
+```
+
+
+
+## 2、架构图
+
+![image-20210203203437464](geektime-etcd.assets/image-20210203203437464.png)
+
+> treeIndex 模块基于内存版 B-tree 实现了 key 索引管理，它保存了用户 key 与版本号（revision）的映射关系等信息。
+>
+> 
+>
+> Backend 模块负责 etcd 的 key-value 持久化存储，主要由 ReadTx、BatchTx、Buffer 组成，ReadTx 定义了抽象的读事务接口，BatchTx 在 ReadTx 之上定义了抽象的写事务接口，Buffer 是数据缓存区。
+>
+> 
+>
+> etcd 设计上支持多种 Backend 实现，目前实现的 Backend 是 boltdb。**boltdb 是一个基于 B+ tree 实现的、支持事务的 key-value 嵌入式数据库。**
+
+
+
+treeIndex 与 boltdb 关系你可参考下图。当你发起一个 get hello 命令时，从 treeIndex 中获取 key 的版本号，然后再通过这个版本号，从 boltdb 获取 value 信息。boltdb 的 value 是包含用户 key-value、各种版本号、lease 信息的结构体。
+
+![image-20210203203703589](geektime-etcd.assets/image-20210203203703589.png)
+
+
+
+## 3、treeIndex
+
+### 那 etcd v3 又是如何基于 treeIndex 模块，实现保存 key 的历史版本的呢?
+
+etcd 在每次修改 key 时会生成一个全局递增的版本号（revision），然后通过数据结构 B-tree 保存用户 key 与版本号之间的关系，再以版本号作为 boltdb key，以用户的 key-value 等信息作为 boltdb value，保存到 boltdb。
+
+
+
+### 为什么 etcd 使用它而不使用哈希表、平衡二叉树？
+
+从 etcd 的功能特性上分析， ==因 etcd 支持范围查询，因此保存索引的数据结构也必须支持范围查询才行。所以哈希表不适合，而 B-tree 支持范围查询。==
+
+从性能上分析，==平横二叉树每个节点只能容纳一个数据、导致树的高度较高，而 B-tree 每个节点可以容纳多个数据，树的高度更低，更扁平，涉及的查找次数更少，具有优越的增、删、改、查性能。==
+
+
+
+## 4、MVCC更新key的原理
+
+> 1. 当你通过 etcdctl 发起一个 put hello 操作时，在 put 写事务中，首先它需要从 treeIndex 模块中查询 key 的 keyIndex 索引信息.
+> 2. keyIndex 中存储了 key 的创建版本号、修改的次数等信息，这些信息在事务中发挥着重要作用，因此会存储在 boltdb 的 value 中。
+
+
+
+![image-20210203204206458](geektime-etcd.assets/image-20210203204206458.png)
+
+
+
+
+
+boltdb 的 value 是 mvccpb.KeyValue 结构体，它是由用户 key、value、create_revision、mod_revision、version、lease 组成。它们的含义分别如下：
+
+
+
+<font color=red size=5x>**create_revision** </font>表示此 key 创建时的版本号。在我们的案例中，key hello 是第一次创建，那么值就是 2。当你再次修改 key hello 的时候，写事务会从 treeIndex 模块查询 hello 第一次创建的版本号，也就是 keyIndex.generations[i].created 字段，赋值给 create_revision 字段；
+
+
+
+<font color=red size=5x>**mod_revision**</font> 表示 key 最后一次修改时的版本号，即 put 操作发生时的全局版本号加 1；
+
+
+
+<font color=red size=5x>**version**</font> 表示此 key 的修改次数。每次修改的时候，写事务会从 treeIndex 模块查询 hello 已经历过的修改次数，也就是 keyIndex.generations[i].ver 字段，将 ver 字段值加 1 后，赋值给 version 字段。
+
+
+
+
+
+## 5、MVCC查询原理
+
+完成 put hello 为 world1 操作后，这时你通过 etcdctl 发起一个 get hello 操作，MVCC 模块首先会创建一个读事务对象（TxnRead），在 etcd 3.4 中 Backend 实现了 ConcurrentReadTx， 也就是并发读特性。
+
+
+
+==并发读特性的核心原理是创建读事务对象时，它会全量拷贝当前写事务未提交的 buffer 数据，并发的读写事务不再阻塞在一个 buffer 资源锁上，实现了全并发读。==
+
+
+
+![image-20210203204608541](geektime-etcd.assets/image-20210203204608541.png)
 
 
 
@@ -1083,42 +1261,35 @@ etcd Lessor 主循环<font color=red size=5x>**每隔 500ms 执行一次撤销 L
 
 
 
+## 6、删除原理
+
+当你执行 etcdctl del hello 命令时，etcd 会立刻从 treeIndex 和 boltdb 中删除此数据吗？还是增加一个标记实现延迟删除（lazy delete）呢？
 
 
 
+答案为 etcd 实现的是延期删除模式，原理与 key 更新类似。
 
 
 
+> 与更新 key 不一样之处在于，一方面，生成的 boltdb key 版本号{4,0,t}追加了删除标识（tombstone, 简写 t），boltdb value 变成只含用户 key 的 KeyValue 结构体。另一方面 treeIndex 模块也会给此 key hello 对应的 keyIndex 对象，追加一个空的 generation 对象，表示此索引对应的 key 被删除了。
 
 
 
+==当你再次查询 hello 的时候，treeIndex 模块根据 key hello 查找到 keyindex 对象后，若发现其存在空的 generation 对象，并且查询的版本号大于被删除时的版本号，则会返回空。==
 
 
 
+### 那么 key 打上删除标记后有哪些用途呢？什么时候会真正删除它呢？
+
+1. <font color=red size=5x>**异步watch删除**</font>
+2. <font color=red size=5x>重启的时候检查</font>
+3. <font color=red size=5x>**压缩组件和检测数据是否删除**</font>
+
+一方面删除 key 时会生成 events，Watch 模块根据 key 的删除标识，会生成对应的 Delete 事件。
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+另一方面，当你重启 etcd，遍历 boltdb 中的 key 构建 treeIndex 内存树时，你需要知道哪些 key 是已经被删除的，并为对应的 key 索引生成 tombstone 标识。而真正删除 treeIndex 中的索引对象、boltdb 中的 key 是通过压缩 (compactor) 组件异步完成。正因为 etcd 的删除 key 操作是基于以上延期删除原理实现的，因此只要压缩组件未回收历史版本，我们就能从 etcd 中找回误删的数据。
 
 
 
