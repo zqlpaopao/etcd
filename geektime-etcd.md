@@ -652,6 +652,43 @@ world2
 
 
 
+## Watch 
+
+```go
+$ etcdctl put hello world1
+$ etcdctl put hello world2
+$ etcdctl watch hello -w=json --rev=1
+{
+    "Events":[
+        {
+            "kv":{
+                "key":"aGVsbG8=",
+                "create_revision":2,
+                "mod_revision":2,
+                "version":1,
+                "value":"d29ybGQx"
+            }
+        },
+        {
+            "kv":{
+                "key":"aGVsbG8=",
+                "create_revision":2,
+                "mod_revision":3,
+                "version":2,
+                "value":"d29ybGQy"
+            }
+        }
+    ],
+    "CompactRevision":0,
+    "Canceled":false,
+    "Created":false
+}
+```
+
+
+
+
+
 
 
 # ==Raft协议==
@@ -1295,21 +1332,104 @@ boltdb 的 value 是 mvccpb.KeyValue 结构体，它是由用户 key、value、c
 
 
 
+# 10、Watch
+
+## 总结
+
+> 在获取事件机制、事件历史版本存储两个问题中，我给你介绍了 etcd v2 在使用 HTTP/1.x 轮询、滑动窗口时，存在大量的连接数、丢事件等问题，导致扩展性、稳定性较差。
+>
+> 而 etcd v3 Watch 特性优化思路是基于 HTTP/2 的流式传输、多路复用，实现了一个连接支持多个 watcher，减少了大量连接数，事件存储也从滑动窗口优化成稳定可靠的 MVCC 机制，历史版本保存在磁盘中，具备更好的扩展性、稳定性。
+>
+> 在实现可靠的事件推送机制问题中，我通过一个整体架构图带你了解整个 Watch 机制的核心链路，数据推送流程。Watch 特性的核心实现模块是 watchableStore，它通过将 watcher 划分为 synced/unsynced/victim 三类，将问题进行了分解，并通过多个后台异步循环 goroutine 负责不同场景下的事件推送，提供了各类异常等场景下的 Watch 事件重试机制，尽力确保变更事件不丢失、按逻辑时钟版本号顺序推送给 client。
+>
+> 
+>
+> 最后一个事件匹配性能问题，etcd 基于 map 和区间树数实现了 watcher 与事件快速匹配，保障了大规模场景下的 Watch 机制性能和读写稳定性。
+
+## 1、命令行watch
+
+```go
+$ etcdctl put hello world1
+$ etcdctl put hello world2
+$ etcdctl watch hello -w=json --rev=1
+{
+    "Events":[
+        {
+            "kv":{
+                "key":"aGVsbG8=",
+                "create_revision":2,
+                "mod_revision":2,
+                "version":1,
+                "value":"d29ybGQx"
+            }
+        },
+        {
+            "kv":{
+                "key":"aGVsbG8=",
+                "create_revision":2,
+                "mod_revision":3,
+                "version":2,
+                "value":"d29ybGQy"
+            }
+        }
+    ],
+    "CompactRevision":0,
+    "Canceled":false,
+    "Created":false
+}
+```
+
+
+
+## 2、client获取事件的机制
+
+> 1. <font color=red size=5x>**V2使用的是HTTP/1.x协议**</font>
+> 2. <font color=re size=5x>**V3使用的是HTTP/2的gRPC协议.连接多路复用**</font>
+> 3. <font color=green size=5x>**在 clientv3 库中，Watch 特性被抽象成 Watch、Close、RequestProgress 三个简单 API 提供给开发者使用，屏蔽了 client 与 gRPC WatchServer 交互的复杂细节，实现了一个 client 支持多个 gRPC Stream，一个 gRPC Stream 支持多个 watcher，显著降低了你的开发复杂度。**</font>
+> 4. <font color=red size=5x>**同时当 watch 连接的节点故障，clientv3 库支持自动重连到健康节点，并使用之前已接收的最大版本号创建新的 watcher，避免旧事件回放等。**</font>
+
+
+
+### HTTP2为什么能多路复用
+
+![image-20210206211820909](geektime-etcd.assets/image-20210206211820909.png)
+
+> 在 HTTP/2 协议中，HTTP 消息被分解独立的帧（Frame），交错发送，帧是最小的数据单位。每个帧会标识属于哪个流（Stream），流由多个数据帧组成，每个流拥有一个唯一的 ID，一个数据流对应一个请求或响应包。
+
+
+
+## 3、事件是如何存储的-保留多久
+
+> 1. <font color=red size=5x>**etcdV2中使用的是内存eventQuenue的环形数组,初始化为1000.满了删除最旧的,会造成历史数据的重建watcher事件,造成资源浪费**</font>
+> 2. <font color=re size=5x>**etcd V3的MVCC机制件将key的历史版本事件保存在boltdb中,进行持久化存储,冲载客防止丢失**</font>
+> 3. <font color=red size=5x>**版本号是为了方式crash后丢失事件,版本号是etcd的逻辑时钟,重启会重载历史版本数据,不会丢失事件**</font>
+
+
+
+## 4、网络异常,事件堆积,server会丢失数据吗,监听的版本号丢失,server怎么处理
+
+> 1. <font color=red size=5x>**可靠事件推送**</font>
+> 2. <font color=red size=5x>****</font>
+> 3. <font color=red size=5x>****</font>
 
 
 
 
 
+### 可靠事件推送机制
+
+![image-20210206213053046](geektime-etcd.assets/image-20210206213053046.png)
 
 
 
 
 
-
-
-
-
-
+> 1. synced watcher，顾名思义，表示此类 watcher 监听的数据都已经同步完毕，在等待新的变更。
+> 2. unsynced watcher，表示此类 watcher 监听的数据还未同步完成，落后于当前最新数据变更，正在努力追赶。
+>
+> 
+>
+> 1. 如果你创建的 watcher 指定版本号小于 etcd server 当前最新版本号，那么它就会保存到 unsynced watcherGroup 中。比如我们的这个案例中 watch 带指定版本号 1 监听时，版本号 1 和 etcd server 当前版本之间的数据并未同步给你，因此它就属于此类。
 
 
 
