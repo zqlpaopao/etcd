@@ -687,6 +687,33 @@ $ etcdctl watch hello -w=json --rev=1
 
 
 
+## 命令行事务操作
+
+```go
+$ etcdctl txn -i
+compares: //对应If语句
+value("Alice") = "200" //判断Alice账号资金是否为200
+
+
+success requests (get, put, del): //对应Then语句
+put Alice 100 //Alice账号初始资金200减100
+put Bob 300 //Bob账号初始资金200加100
+
+
+failure requests (get, put, del): //对应Else语句
+get Alice  
+get Bob
+
+
+SUCCESS
+
+
+OK
+
+OK
+
+```
+
 
 
 
@@ -1433,11 +1460,100 @@ $ etcdctl watch hello -w=json --rev=1
 
 
 
+# 11、事务
 
 
 
+## 1、支持比较的版本号
+
+```go
+client.Txn(ctx).If(cmp1, cmp2, ...).Then(op1, op2, ...,).Else(op1, op2, …)
+```
 
 
+
+> 1. <font color=red size=5x>**key 的最近一次修改版本号 mod_revision**</font>这就可以通过 mod("Alice") = "v1" 条件表达式来保障转账安全性。
+>
+> 
+>
+> 2. <font color=re size=5x>**key 的创建版本号 create_revision，简称 create。**</font>只有分布式锁 key(lock) 不存在的时候，你才能发起 put 操作创建锁，这时你可以通过 create("lock") = "0"来判断，因为一个 key **不存在的话它的 create_revision 版本号就是 0。**
+>
+> 
+>
+> 3. <font color=green size=5x>**key 的修改次数 version**</font>可以通过 version("key") < "3"来判断。
+> 4. ==等于、大于、小于、不等于)，实现了灵活的比较的功能==
+
+
+
+## 2、命令行事务操作
+
+```go
+
+$ etcdctl txn -i
+compares: //对应If语句
+value("Alice") = "200" //判断Alice账号资金是否为200
+
+
+success requests (get, put, del): //对应Then语句
+put Alice 100 //Alice账号初始资金200减100
+put Bob 300 //Bob账号初始资金200加100
+
+
+failure requests (get, put, del): //对应Else语句
+get Alice  
+get Bob
+
+
+SUCCESS
+
+
+OK
+
+OK
+
+```
+
+
+
+## 3、架构图
+
+![image-20210208202549760](geektime-etcd.assets/image-20210208202549760.png)
+
+
+
+它首先对你的事务的 If 语句进行检查，也就是 ApplyCompares 操作，如果通过此操作，则执行 ApplyTxn/Then 语句，否则执行 ApplyTxn/Else 语句。
+
+
+
+## 3、原子性和持久性
+
+![image-20210208202805230](geektime-etcd.assets/image-20210208202805230.png)
+
+
+
+T1 时间点
+
+>  T1 时间点是在 Alice 账号扣款 100 元完成时，Bob 账号资金还未成功增加时突然发生了 crash。
+>
+> 
+>
+> 从前面介绍的 etcd 写原理和上面流程图我们可知，此时 MVCC 写事务持有 boltdb 写锁，仅是将修改提交到了内存中，保证幂等性、防止日志条目重复执行的一致性索引 consistent index 也并未更新。同时，负责 boltdb 事务提交的 goroutine 因无法持有写锁，也并未将事务提交到持久化存储中。
+>
+> 
+>
+> 因此，T1 时间点发生 crash 异常后，事务并未成功执行和持久化任意数据到磁盘上。在节点重启时，etcd server 会重放 WAL 中的已提交日志条目，再次执行以上转账事务。因此不会出现 Alice 扣款成功、Bob 到帐失败等严重 Bug，极大简化了业务的编程复杂度。
+
+
+
+T2 时间点
+
+> T2 时间点是在 MVCC 写事务完成转账，server 返回给 client 转账成功后，boltdb 的事务提交 goroutine，批量将事务持久化到磁盘中时发生了 crash。这时 etcd 又是如何保证原子性和持久性的呢?
+>
+> 
+>
+> 我们知道一致性索引 consistent index 字段值是和 key-value 数据在一个 boltdb 事务里同时持久化到磁盘中的。若在 boltdb 事务提交过程中发生 crash 了，简单情况是 consistent index 和 key-value 数据都更新失败。那么当节点重启，etcd server 重放 WAL 中已提交日志条目时，同样会再次应用转账事务到状态机中，因此事务的原子性和持久化依然能得到保证。
+>
+> 
 
 
 
