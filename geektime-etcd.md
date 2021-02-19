@@ -1552,20 +1552,100 @@ T2 时间点
 > 
 >
 > 我们知道一致性索引 consistent index 字段值是和 key-value 数据在一个 boltdb 事务里同时持久化到磁盘中的。若在 boltdb 事务提交过程中发生 crash 了，简单情况是 consistent index 和 key-value 数据都更新失败。那么当节点重启，etcd server 重放 WAL 中已提交日志条目时，同样会再次应用转账事务到状态机中，因此事务的原子性和持久化依然能得到保证。
+
+
+
+
+
+# 12、boltdb存储数据
+
+![image-20210219202831251](geektime-etcd.assets/image-20210219202831251.png)
+
+
+
+
+
+# 13、数据压缩
+
+<font color=green size=5x>**周期性压缩和版本号压缩**</font>
+
+> 1. <font color=red size=5x>**Compact接口首先会更新当前 server 已压缩的版本号,并将耗时昂贵的压缩任务保存到 FIFO 队列中==异步执行==**</font>
+>
+> 2. <font color=re size=5x>**压缩任务执行时，它首先会压缩 treeIndex 模块中的 keyIndex 索引**</font>
+>
+> 3. <font color=green size=5x>**其次会遍历 boltdb 中的 key，删除已废弃的 key。**</font>
+>
+> 4. "etcdserver: mvcc: database space exceeded"错误时，若是你未开启压缩策略导致 db 大小达到配额，这时你可以使用 etcdctl compact 命令，主动触发压缩操作，回收历史版本。
+>
+>    
+
+![image-20210219203939113](geektime-etcd.assets/image-20210219203939113.png)
+
+
+
+
+
+## 1、压缩操作
+
+```go
+
+# 获取etcd当前版本号
+$ rev=$(etcdctl endpoint status --write-out="json" | egrep -o '"revision":[0-9]*' | egrep -o '[0-9].*')
+$ echo $rev
+9
+# 执行压缩操作，指定压缩的版本号为当前版本号
+$ etcdctl compact $rev
+Compacted revision 9
+# 压缩一个已经压缩的版本号
+$ etcdctl compact $rev
+Error: etcdserver: mvcc: required revision has been compacted
+# 压缩一个比当前最大版号大的版本号
+$ etcdctl compact 12
+Error: etcdserver: mvcc: required revision is a future revision
+```
+
+
+
+## 2、周期性压缩
+
+etcd 的压缩模式为 periodic，保留时间为你自定义的 1h 等。
+
+压缩参数
+
+```go
+etcd 的压缩模式为 periodic，保留时间为你自定义的 1h 等。
+
+--auto-compaction-retention '0'
+Auto compaction retention length. 0 means disable auto Compaction.
+--auto-compaction-mode 'periodic'
+Interpret 'auto-Compaction-retention' one of: periodic|revision.
+```
+
+> 1. auto-compaction-mode 为 periodic 时，它表示启用时间周期性压缩，auto-compaction-retention 为保留的时间的周期，比如 1h。
+> 2. auto-compaction-mode 为 revision 时，它表示启用版本号压缩模式，auto-compaction-retention 为保留的历史版本号数，比如 10000。
+> 3. 注意，etcd server 的 auto-compaction-retention 为'0'时，将关闭自动压缩策略，
+
+
+
+
+
+## 3、版本号压缩
+
+etcd 启动后会根据你的压缩模式 revision，创建 revision Compactor。revision Compactor 会根据你设置的保留版本号数，每隔 5 分钟定时获取当前 server 的最大版本号，减去你想保留的历史版本数，然后通过 etcd server 的 Compact 接口发起如下的压缩操作即可。
+
+```go
+获取当前版本号，减去保留的版本号数rev := rc.rg.Rev() - rc.retention# 调用server的Compact接口压缩_，err := rc.c.Compact(rc.ctx，&pb.CompactionRequest{Revision: rev})
+```
+
+
+
+## 4、为什么压缩后 db 大小不减少呢?
+
+> 当我们通过 boltdb 删除大量的 key，在事务提交后 B+ tree 经过分裂、平衡，会释放出若干 branch/leaf page 页面，然而 boltdb 并不会将其释放给磁盘，调整 db 大小操作是昂贵的，会对性能有较大的损害。
 >
 > 
-
-
-
-
-
-
-
-
-
-
-
-
+>
+> boltdb 是通过 freelist page 记录这些空闲页的分布位置，当收到新的写请求时，优先从空闲页数组中申请若干连续页使用，实现高性能的读写（而不是直接扩大 db 大小）。当连续空闲页申请无法得到满足的时候， boltdb 才会通过增大 db 大小来补充空闲页。
 
 
 
