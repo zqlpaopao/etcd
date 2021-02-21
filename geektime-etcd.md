@@ -1649,15 +1649,41 @@ etcd 启动后会根据你的压缩模式 revision，创建 revision Compactor�
 
 
 
+# 14、数据一致性
+
+真相终于浮出水面，原来当你无意间重启 etcd 的时候，如果最后一条命令是鉴权相关的，它并不会持久化 consistent index（KV 接口会持久化）。consistent index 在03里我们详细介绍了，它具有幂等作用，可防止命令重复执行。
+
+consistent index 的未持久化最终导致鉴权命令重复执行。恰好鉴权模块的 RoleGrantPermission 接口未实现幂等，重复执行会修改鉴权版本号。一连串的 Bug 最终导致鉴权号出现不一致，随后又放大成 MVCC 模块的 key-value 数据不一致，导致严重的数据毁坏。
+
+
+
+这个 Bug 影响 etcd v3 所有版本长达 3 年之久。查清楚问题后，我们也给社区提交了解决方案，合并到 master 后，同时 cherry-pick 到 etcd 3.3 和 3.4 稳定版本中。==etcd v3.3.21 和 v3.4.8 后的版本已经修复此 Bug。==
+
+
+
+# 15、db大小
+
+## 为什么不建议过大
+
+> 1. <font color=red size=5x>**==启动耗时==,启动的时候需要 便利boltdb,在内存中重建treeIndex**</font>
+> 2. <font color=re size=5x>**==节点内存配置==,启动的时候会讲mmap文件映射到内存中,节点内存不可用的时候,导致缺页**</font>
+> 3. <font color=green size=5x>**== treeIndex 索引性能==,etcd不支持数据分片,数据量大的时候性能下降明显**</font>
+> 4. <font color=red size=5x>**==集群稳定==,有大key的时候,出现请求超时,会容易OOM**</font>
+> 5. <font color=red、 size=5x>**==数据款着==Fllower落后Leader较多的时候,大的文件传输会消耗更多资源**</font>
+
+
+
+> 1. 首先是启动耗时。etcd 启动的时候，需打开 boltdb db 文件，读取 db 文件所有 key-value 数据，用于重建内存 treeIndex 模块。因此在大量 key 导致 db 文件过大的场景中，这会导致 etcd 启动较慢。
+> 2. 其次是节点内存配置。etcd 在启动的时候会通过 mmap 将 db 文件映射内存中，若节点可用内存不足，小于 db 文件大小时，可能会出现缺页文件中断，导致服务稳定性、性能下降。
+> 3. 接着是 treeIndex 索引性能。因 etcd 不支持数据分片，内存中的 treeIndex 若保存了几十万到上千万的 key，这会增加查询、修改操作的整体延时。
+> 4. 再次是集群稳定性。大 db 文件场景下，无论你是百万级别小 key 还是上千个大 value 场景，一旦出现 expensive request 后，很容易导致 etcd OOM、节点带宽满而丢包。
+> 5. 最后是快照。当 Follower 节点落后 Leader 较多数据的时候，会触发 Leader 生成快照重建发送给 Follower 节点，Follower 基于它进行还原重建操作。较大的 db 文件会导致 Leader 发送快照需要消耗较多的 CPU、网络带宽资源，同时 Follower 节点重建还原慢。
 
 
 
 
 
-
-
-
-
+# 16、etcd timeOut
 
 
 
